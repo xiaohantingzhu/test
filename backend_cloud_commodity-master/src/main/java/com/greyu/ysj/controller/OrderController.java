@@ -1,176 +1,221 @@
-package com.greyu.ysj.controller;
+package com.esto.ilive.controller;
 
-import com.greyu.ysj.authorization.annotation.Authorization;
-import com.greyu.ysj.config.ResultStatus;
-import com.greyu.ysj.entity.Order;
-import com.greyu.ysj.model.ResultModel;
-import com.greyu.ysj.service.OrderService;
-import com.sun.org.apache.regexp.internal.RE;
+
+import cn.afterturn.easypoi.excel.ExcelExportUtil;
+import cn.afterturn.easypoi.excel.entity.ExportParams;
+import com.esto.ilive.config.Configure;
+import com.esto.ilive.config.WebLogAspect;
+import com.esto.ilive.dao.OrderinformationMapper;
+import com.esto.ilive.domain.*;
+import com.esto.ilive.pojo.OrderDeviceKeyWithName;
+import com.esto.ilive.service.*;
+import com.esto.ilive.service.redisMessage.ActiveSendMsg;
+import com.esto.ilive.service.redisMessage.ActiveService;
+import com.esto.ilive.service.redisMessage.RedisService;
+import com.esto.ilive.utils.JsonObjectResult;
+import com.esto.ilive.utils.JsonResult;
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiImplicitParam;
+import io.swagger.annotations.ApiImplicitParams;
+import io.swagger.annotations.ApiOperation;
+import org.apache.poi.ss.usermodel.Workbook;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.text.ParseException;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.sql.Timestamp;
 import java.text.SimpleDateFormat;
-import java.util.Date;
 import java.util.List;
 
 /**
- * @Description:
- * @Author: gre_yu@163.com
- * @Date: Created in 21:57 2018/3/11.
+ * 订单管理
+ * @author: lixiao
+ * @date: 2018/9/26
  */
+@Api(value = "OrderController", description = "订单管理接口")
 @RestController
 public class OrderController {
+
+    @Autowired
+    private OrderinformationMapper orderinformationMapper;
+
+    @Autowired
+    private OrderDeviceService orderDeviceService;
+
     @Autowired
     private OrderService orderService;
 
-    @RequestMapping(value = "/admin/v1/order", method = RequestMethod.GET)
-    @Authorization
-    public ResponseEntity<ResultModel> getAllOrders(Integer page, Integer rows,
-                                                   String orderBy, Order order,
-                                                   String start, String end,
-                                                   String userName) {
-        List<Order> orders = this.orderService.getAllOrders(page, rows, orderBy, order, userName, start, end);
+    @Autowired
+    private RedisService redisService;
 
-        return new ResponseEntity<ResultModel>(ResultModel.ok(orders),HttpStatus.OK);
+    @Autowired
+    private ActiveService activeService;
+
+    @Autowired
+    private ActiveSendMsg activeSendMsg;
+
+    @Autowired
+    private DeviceService deviceService;
+
+    @ApiOperation(value = "创建订单")
+    @PostMapping("/api/order/create")
+    public JsonResult createOrder(@RequestBody Orderinformation orderinformation){
+        JsonResult jsonResult = new JsonResult();
+        try{
+            if(orderService.insert(orderinformation) == 1){
+                return Configure.setResult();
+            }
+        }catch(Exception e){
+            e.printStackTrace();
+            jsonResult.setCode(300);
+            jsonResult.setMessage("订单号重复");
+            return jsonResult;
+        }finally{
+            return  jsonResult;
+        }
+    }
+
+    @ApiOperation(value = "删除订单")
+    @PostMapping("/api/order/delete")
+    public JsonResult batchDeleteOrder(@RequestBody Integer[] item){
+        orderinformationMapper.deleteOrderList(item);
+        return Configure.setResult();
+    }
+
+    @ApiOperation(value = "更新订单")
+    @PostMapping("/api/order/update")
+    public JsonResult updateOrder(@RequestBody Orderinformation orderinformation){
+        JsonResult jsonResult = new JsonResult();
+        try {
+            if( orderService.updateByPrimaryKey(orderinformation) == 1){
+                return Configure.setResult();
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            jsonResult.setCode(300);
+            jsonResult.setMessage("订单号重复");
+            return jsonResult;
+        }finally {
+            return jsonResult;
+        }
+    }
+
+    @ApiOperation(value = "查询订单")
+    @ApiImplicitParams({@ApiImplicitParam(name = "id", value = "id号", required = false, dataType = "Integer"),
+            @ApiImplicitParam(name = "ordernumber", value = "订单号", required = false, dataType = "String"),
+            @ApiImplicitParam(name = "servicemanid", value = "维保人员", required = false, dataType = "String")
+    })
+    @GetMapping("/api/order/list")
+    public JsonObjectResult findOneOrder(@RequestParam(value = "ordernumber", required = false) String ordernumber,
+                                         @RequestParam(value = "servicemanid", required = false) String servicemanid,
+                                         @RequestParam(value = "id", required=false) Integer id) {
+        JsonObjectResult jsonObjectResult = new JsonObjectResult();
+        OrderDeviceInfo order = new OrderDeviceInfo();
+        order.setServicemanid(servicemanid);
+        order.setOrdernumber(ordernumber);
+        order.setId(id);
+        jsonObjectResult.setObj(orderService.getOrderByIf(order));
+        return jsonObjectResult;
+    }
+
+    @ApiOperation(value = "删除已经激活订单")
+    @PostMapping("/api/order/device_bind_delete")
+    public JsonResult deleteBindDevice(@RequestBody OrderDevicesKey orderDevicesKey){
+        orderDeviceService.deleteByPrimaryKey(orderDevicesKey);
+        Device device = deviceService.selectByMchineId(orderDevicesKey.getMachineid());
+        device.setActivationtime(null);
+        deviceService.updateByPrimaryKey(device);
+        return Configure.setResult();
     }
 
     /**
-     * 获取订单资讯
+     * 订单激活绑定
+     * @param orderDeviceKeyWithName
      * @return
      */
-    @RequestMapping(value = "/admin/v1/statistics/order", method = RequestMethod.GET)
-    @Authorization
-    public ResponseEntity<ResultModel> orderCount() {
-        ResultModel resultModel = this.orderService.orderStatistics();
-        return new ResponseEntity<ResultModel>(resultModel, HttpStatus.OK);
+    @ApiOperation(value = "订单激活绑定")
+    @PostMapping("/api/order/device_bind")
+    public JsonResult bindDevice(@RequestBody OrderDeviceKeyWithName orderDeviceKeyWithName) {
+        JsonResult jsonResult = new JsonResult();
+        String activePerson = orderDeviceKeyWithName.getFirstcommissioner();
+        OrderDevicesKey orderDevicesKey = new OrderDevicesKey();
+        orderDevicesKey.setMachineid(orderDeviceKeyWithName.getMachineid());
+        orderDevicesKey.setOrdernumber(orderDeviceKeyWithName.getOrdernumber());
+        try {
+            OrderDevicesKey orderDevicesKey1 = orderDeviceService.isExistOrderDevice(orderDevicesKey);
+            if(orderDevicesKey1 != null){
+                jsonResult.setCode(300);
+                String message = "整机ID：" + orderDevicesKey1.getMachineid() + "在订单：" + orderDevicesKey1.getOrdernumber() +"中激活";
+                jsonResult.setMessage(message);
+                return jsonResult;
+            }else{
+                //发送激活消息
+                activeSendMsg.sendMsg(orderDevicesKey);
+                //判断激活消息
+                System.out.println("开始判断激活消息");
+                String activeResult = activeService.activeCheck(orderDevicesKey);
+                System.out.println("激活消息判断完成，activeResult="+activeResult);
+                if (activeResult != null && activeResult.equals("succeed")) {
+                    jsonResult.setMessage("ok");
+                    jsonResult.setCode(200);
+                    Device device = deviceService.selectByMchineId(orderDevicesKey.getMachineid());
+                    if(device == null){
+                        jsonResult.setCode(300);
+                        jsonResult.setMessage("设备不存在");
+                        return jsonResult;
+                    }else{
+                        int ret = orderDeviceService.insert(orderDevicesKey);
+                        device.setActivationtime(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format( new Timestamp(System.currentTimeMillis())));
+                        device.setFirstcommissioner(activePerson);
+                        deviceService.updateByPrimaryKey(device);
+                        return jsonResult;
+                    }
+                } else {
+                    jsonResult.setCode(300);
+                    jsonResult.setMessage("激活失败"+activeResult);
+                    return jsonResult;
+                }
+            }
+        }catch (Exception e){
+            e.printStackTrace();
+            jsonResult.setCode(300);
+            jsonResult.setMessage("激活失败");
+            return jsonResult;
+        }
     }
 
-    @RequestMapping(value = "/user/v1/order/{orderId}", method = RequestMethod.GET)
-    @Authorization
-    public ResponseEntity<ResultModel> getOneOrder(@PathVariable Long orderId) {
-        ResultModel resultModel = this.orderService.getOneOrder(orderId);
 
-        if (resultModel.getCode() == -1002) {
-            return new ResponseEntity<ResultModel>(resultModel, HttpStatus.NOT_FOUND);
+    @ApiOperation(value = "订单表下载")
+    @GetMapping("/api/order/download")
+    public JsonResult downloadOrder(HttpServletRequest request, HttpServletResponse response) throws Exception {
+        List<OrderDeviceInfo> orders = orderService.getOrderList();
+        System.out.println(orders);
+        Workbook workbook = ExcelExportUtil.exportExcel(new ExportParams(), OrderDeviceInfo.class, orders);
+        File savefile = new File("D:/excel/");
+        if (!savefile.exists()) {
+            savefile.mkdirs();
         }
-
-        return new ResponseEntity<ResultModel>(resultModel, HttpStatus.OK);
+        String time = new SimpleDateFormat("yyyyMMddHHmmss").format( new Timestamp(System.currentTimeMillis()));
+        String filename = time +".xls";
+        String path = "D:/excel/order" + filename;
+        FileOutputStream fos = new FileOutputStream(path);
+        workbook.write(fos);
+        fos.close();
+        //workbook.write(response.getOutputStream());
+        JsonResult jsonResult = new JsonResult();
+        String path1 = "/download/order" + filename;
+        jsonResult.setCode(200);
+        jsonResult.setMessage(path1);
+        return jsonResult;
     }
 
-    @RequestMapping(value = "/user/v1/user/{userId}/order", method = RequestMethod.GET)
-    @Authorization
-    public ResponseEntity<ResultModel> getOrderByUserId(@PathVariable Integer userId, Integer status) {
-        System.out.println(status);
-        ResultModel resultModel = this.orderService.getOrderByUserId(userId ,status);
-        return new ResponseEntity<ResultModel>(resultModel, HttpStatus.OK);
-    }
 
-    @RequestMapping(value = "/user/v1/user/{userId}/order", method = RequestMethod.POST)
-    @Authorization
-    public ResponseEntity<ResultModel> createOrder(@PathVariable Integer userId, Integer addressId, String remarks, String cartDetailIds) {
-        if (null == userId ||
-                null == addressId ||
-                null == cartDetailIds) {
-            return new ResponseEntity<ResultModel>(ResultModel.error(ResultStatus.DATA_NOT_NULL), HttpStatus.BAD_REQUEST);
-        }
 
-        ResultModel resultModel = this.orderService.create(userId, addressId, remarks, cartDetailIds);
-
-        if (resultModel.getCode() == -1002) {
-            return new ResponseEntity<ResultModel>(resultModel, HttpStatus.NOT_FOUND);
-        }
-        if (resultModel.getCode() == -1004) {
-            return new ResponseEntity<ResultModel>(resultModel, HttpStatus.BAD_REQUEST);
-        }
-
-        return new ResponseEntity<ResultModel>(resultModel, HttpStatus.OK);
-    }
-
-    /**
-     * 发货
-     * @param orderId
-     * @return
-     */
-    @RequestMapping(value = "/admin/v1/order/{orderId}/deliver", method = RequestMethod.PATCH)
-    @Authorization
-    public ResponseEntity<ResultModel> deliver(@PathVariable Long orderId) {
-        ResultModel resultModel = this.orderService.deliver(orderId);
-
-        if (resultModel.getCode() == -1002) {
-            return new ResponseEntity<ResultModel>(resultModel, HttpStatus.NOT_FOUND);
-        }
-
-        return new ResponseEntity<ResultModel>(resultModel, HttpStatus.OK);
-    }
-
-    /**
-     * 配送完成
-     * @param orderId
-     * @return
-     */
-    @RequestMapping(value = "/admin/v1/order/{orderId}/confirm", method = RequestMethod.PATCH)
-    @Authorization
-    public ResponseEntity<ResultModel> confirm(@PathVariable Long orderId) {
-        ResultModel resultModel = this.orderService.confirm(orderId);
-
-        if (resultModel.getCode() == -1002) {
-            return new ResponseEntity<ResultModel>(resultModel, HttpStatus.NOT_FOUND);
-        }
-
-        return new ResponseEntity<ResultModel>(resultModel, HttpStatus.OK);
-    }
-
-    /**
-     * 拒绝退款
-     * @param orderId
-     * @return
-     */
-    @RequestMapping(value = "/admin/v1/order/{orderId}/refuse", method = RequestMethod.PATCH)
-    @Authorization
-    public ResponseEntity<ResultModel> refuseRefund(@PathVariable Long orderId) {
-        ResultModel resultModel = this.orderService.refuseRefund(orderId);
-
-        if (resultModel.getCode() == -1002) {
-            return new ResponseEntity<ResultModel>(resultModel, HttpStatus.NOT_FOUND);
-        }
-
-        return new ResponseEntity<ResultModel>(resultModel, HttpStatus.OK);
-    }
-
-    /**
-     * 申请退款
-     * @param orderId
-     * @return
-     */
-    @RequestMapping(value = "/user/v1/order/{orderId}/refund", method = RequestMethod.POST)
-    @Authorization
-    public ResponseEntity<ResultModel> refund(@PathVariable Long orderId) {
-        ResultModel resultModel = this.orderService.refund(orderId);
-
-        if (resultModel.getCode() == -1002) {
-            return new ResponseEntity<ResultModel>(resultModel, HttpStatus.NOT_FOUND);
-        }
-
-        return new ResponseEntity<ResultModel>(resultModel, HttpStatus.OK);
-    }
-
-    /**
-     * 同意退款
-     * @param orderId
-     * @return
-     */
-    @RequestMapping(value = "/admin/v1/order/{orderId}/refund", method = RequestMethod.DELETE)
-    @Authorization
-    public ResponseEntity<ResultModel> confirmRefund(@PathVariable Long orderId) {
-        ResultModel resultModel = this.orderService.confirmRefund(orderId);
-
-        if (resultModel.getCode() == -1002) {
-            return new ResponseEntity<ResultModel>(resultModel, HttpStatus.NOT_FOUND);
-        }
-
-        return new ResponseEntity<ResultModel>(resultModel, HttpStatus.OK);
-    }
 }
+
+
